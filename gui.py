@@ -54,7 +54,6 @@ from tkinter import colorchooser, filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
 
-import aruco_dialog
 import aruco_gen
 import image_loader
 import matrix_link
@@ -143,6 +142,9 @@ class MatrixApp:
         self.var_border = tk.BooleanVar(value=renderer.DEFAULTS.border)
         self.var_background = tk.BooleanVar(value=False)
         self.var_live = tk.BooleanVar(value=True)
+        self.var_aruco_dict = tk.StringVar(value=aruco_gen.DEFAULT_DICTIONARY)
+        self.var_aruco_id = tk.StringVar(value="0")
+        self.var_aruco_border = tk.StringVar(value="1")
 
         self._build_ui()
         self._auto_size_window()
@@ -231,8 +233,31 @@ class MatrixApp:
         box = ttk.LabelFrame(parent, text="Image", padding=8)
         box.pack(fill="x", pady=(0, 8))
         ttk.Button(box, text="Open Image...", command=self._on_open_image).pack(fill="x")
-        ttk.Button(box, text="Generate ArUco Marker...", command=self._on_generate_aruco).pack(fill="x", pady=(6, 0))
-        ttk.Button(box, text="Save Image...", command=self._on_save_image).pack(fill="x", pady=(6, 0))
+
+        ttk.Separator(box, orient="horizontal").pack(fill="x", pady=(10, 8))
+
+        ttk.Label(box, text="ArUco Dictionary").pack(anchor="w")
+        self.combo_aruco_dict = ttk.Combobox(
+            box, state="readonly", textvariable=self.var_aruco_dict,
+            values=sorted(aruco_gen.DICTIONARIES))
+        self.combo_aruco_dict.pack(fill="x", pady=(0, 6))
+        self.combo_aruco_dict.bind("<<ComboboxSelected>>", lambda _e: self._update_aruco_range_label())
+
+        id_row = ttk.Frame(box)
+        id_row.pack(fill="x")
+        ttk.Label(id_row, text="Marker ID").pack(side="left")
+        ttk.Entry(id_row, textvariable=self.var_aruco_id, width=8).pack(side="left", padx=(6, 12))
+        ttk.Label(id_row, text="Border bits").pack(side="left")
+        ttk.Entry(id_row, textvariable=self.var_aruco_border, width=6).pack(side="left", padx=(6, 0))
+
+        self.lbl_aruco_range = ttk.Label(box, text="", foreground="#666")
+        self.lbl_aruco_range.pack(anchor="w", pady=(2, 0))
+        self._update_aruco_range_label()
+
+        ttk.Button(box, text="Generate ArUco Marker", command=self._on_generate_aruco).pack(fill="x", pady=(6, 0))
+
+        ttk.Separator(box, orient="horizontal").pack(fill="x", pady=(10, 8))
+        ttk.Button(box, text="Save Image...", command=self._on_save_image).pack(fill="x")
 
     def _build_render(self, parent):
         box = ttk.LabelFrame(parent, text="Rendering", padding=8)
@@ -446,16 +471,28 @@ class MatrixApp:
             return
         self._load_image_path(path)
 
-    def _on_generate_aruco(self):
-        aruco_dialog.ArucoDialog(self.root, self._generate_and_load_aruco)
+    def _update_aruco_range_label(self):
+        size = aruco_gen.dictionary_size(self.var_aruco_dict.get())
+        self.lbl_aruco_range.configure(text=f"Valid IDs: 0-{size - 1}")
 
-    def _generate_and_load_aruco(self, dictionary: str, marker_id: int, border_bits: int):
-        """Callback for ArucoDialog: generate the marker, save it as a
-        static PNG under images/ (so it persists as an ordinary file
-        instead of only living in memory for this session), and load it
-        the same way _on_open_image would. Lets aruco_gen's exceptions
-        propagate -- the dialog is what catches and displays those."""
-        gray = aruco_gen.generate_marker(dictionary, marker_id, border_bits=border_bits)
+    def _on_generate_aruco(self):
+        """Read the inline dictionary/ID/border fields, generate the
+        marker, save it as a static PNG under images/ (so it persists as
+        an ordinary file instead of only living in memory for this
+        session), and load it the same way _on_open_image would."""
+        try:
+            marker_id = int(self.var_aruco_id.get())
+            border_bits = int(self.var_aruco_border.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Marker ID and border bits must be whole numbers.",
+                                  parent=self.root)
+            return
+        dictionary = self.var_aruco_dict.get()
+        try:
+            gray = aruco_gen.generate_marker(dictionary, marker_id, border_bits=border_bits)
+        except aruco_gen.ArucoGenError as e:
+            messagebox.showerror("Could not generate marker", str(e), parent=self.root)
+            return
         path = aruco_gen.save_marker_png(gray, dictionary, marker_id, IMAGES_DIR)
         self._load_image_path(path, status_msg=f"Generated and saved {os.path.basename(path)}.")
 
