@@ -2,9 +2,9 @@
 LED Matrix GUI
 ===============
 Interactive control panel for the ESP32 LED matrix: load an image, pick
-two-tone or full-color rendering, adjust colors/threshold/brightness with
-an instant on-screen preview, and push it to the matrix either live as you
-drag a slider or on demand with a Send button.
+two-tone or full-color rendering, adjust colors/brightness with an instant
+on-screen preview, and push it to the matrix either live as you drag a
+slider or on demand with a Send button.
 
 Run:
     python gui.py
@@ -52,8 +52,10 @@ import time
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
-from PIL import ImageTk
+from PIL import Image, ImageTk
 
+import aruco_dialog
+import aruco_gen
 import image_loader
 import matrix_link
 import renderer
@@ -76,7 +78,12 @@ WORKER_JOIN_TIMEOUT_S = 2.5
 STATUS_POLL_MS = 1000     # how often the status window's worker/queue health fields refresh
 HEARTBEAT_INTERVAL_S = 5.0  # idle-time ping cadence -- see _worker's heartbeat branch
 
-DEFAULT_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "attempt1.txt")
+IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
+DEFAULT_IMAGE_PATH = os.path.join(IMAGES_DIR, "attempt1.txt")
+# Separate from IMAGES_DIR (source images, checked into git) -- this is
+# where "Save Image..." writes rendered output. Gitignored since it's a
+# per-user scratch/export location, not project source material.
+SAVED_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_images")
 
 STATUS_COLORS = {"info": "#1a1a1a", "warning": "#a06000", "error": "#b00020"}
 DOT_CONNECTED = "#2e7d32"
@@ -121,6 +128,7 @@ class MatrixApp:
         # Connection state (GUI thread's mirror of the worker's real state --
         # the GUI thread never touches MatrixLink directly)
         self.connected = False
+        self._transport = None  # status_window.TRANSPORT_SERIAL/_WIFI once connected, else None -- see _update_send_visibility
 
         # Worker thread + queues (see module docstring)
         self.cmd_q = queue.Queue()
@@ -130,8 +138,6 @@ class MatrixApp:
 
         # tk variables backing the controls
         self.var_mode = tk.StringVar(value=renderer.TWO_TONE)
-        self.var_threshold = tk.IntVar(value=renderer.DEFAULTS.threshold)
-        self.var_smooth = tk.BooleanVar(value=renderer.DEFAULTS.smooth)
         self.var_brightness = tk.IntVar(value=renderer.DEFAULTS.brightness)
         self.var_invert = tk.BooleanVar(value=renderer.DEFAULTS.invert)
         self.var_border = tk.BooleanVar(value=renderer.DEFAULTS.border)
@@ -140,6 +146,12 @@ class MatrixApp:
 
         self._build_ui()
         self._auto_size_window()
+        # After sizing, not before -- sizing the window around the full
+        # layout (Send section included) means the window is already tall
+        # enough for Send to reappear later without clipping anything below
+        # it, the same class of bug _auto_size_window's docstring warns
+        # about for a fixed size.
+        self._update_send_visibility()
         self._build_status_window()
         self._on_refresh_ports()
         self._worker_thread.start()
@@ -219,6 +231,8 @@ class MatrixApp:
         box = ttk.LabelFrame(parent, text="Image", padding=8)
         box.pack(fill="x", pady=(0, 8))
         ttk.Button(box, text="Open Image...", command=self._on_open_image).pack(fill="x")
+        ttk.Button(box, text="Generate ArUco Marker...", command=self._on_generate_aruco).pack(fill="x", pady=(6, 0))
+        ttk.Button(box, text="Save Image...", command=self._on_save_image).pack(fill="x", pady=(6, 0))
 
     def _build_render(self, parent):
         box = ttk.LabelFrame(parent, text="Rendering", padding=8)
@@ -243,16 +257,6 @@ class MatrixApp:
             bg_row, "background", "Color", self.background_color, fg="white", enabled=False)
         self.btn_background.pack(side="left", padx=(6, 0))
 
-        self.lbl_threshold = ttk.Label(box, text="Threshold")
-        self.lbl_threshold.pack(anchor="w", pady=(8, 0))
-        self.scale_threshold = ttk.Scale(box, from_=0, to=255, variable=self.var_threshold,
-                                          command=self._on_slider_changed)
-        self.scale_threshold.pack(fill="x")
-
-        self.chk_smooth = ttk.Checkbutton(box, text="Smooth ramp (instead of hard threshold)",
-                                           variable=self.var_smooth, command=self._on_settings_changed)
-        self.chk_smooth.pack(anchor="w", pady=(4, 0))
-
         self.btn_color_on = self._make_color_button(box, "on", "Primary Color", self.color_on)
         self.btn_color_on.pack(fill="x", pady=(8, 0))
 
@@ -276,6 +280,7 @@ class MatrixApp:
     def _build_send(self, parent):
         box = ttk.LabelFrame(parent, text="Send", padding=8)
         box.pack(fill="x")
+        self.send_frame = box  # shown/hidden by _update_send_visibility
 
         send_row = ttk.Frame(box)
         send_row.pack(fill="x")
@@ -313,10 +318,13 @@ class MatrixApp:
     def _current_settings(self) -> renderer.RenderSettings:
         return renderer.RenderSettings(
             mode=self.var_mode.get(),
-            threshold=int(round(self.var_threshold.get())),
+            # threshold/smooth aren't user-adjustable (see _build_render) --
+            # every source image here is already pure black/white, so the
+            # default hard threshold always lands cleanly on either side.
+            threshold=renderer.DEFAULTS.threshold,
             color_on=self.color_on,
             color_off=self._current_background(),
-            smooth=self.var_smooth.get(),
+            smooth=renderer.DEFAULTS.smooth,
             brightness=int(round(self.var_brightness.get())),
             invert=self.var_invert.get(),
             border=self.var_border.get(),
@@ -327,7 +335,6 @@ class MatrixApp:
         # ttk.Scale's command fires with a float string; round it back to an
         # int so the numeric value (and the label, if one is added later)
         # doesn't read like 127.94827586.
-        self.var_threshold.set(int(round(self.var_threshold.get())))
         self.var_brightness.set(int(round(self.var_brightness.get())))
         self._on_settings_changed()
 
@@ -337,9 +344,6 @@ class MatrixApp:
 
     def _update_control_states(self):
         full_color = self.var_mode.get() == renderer.FULL_COLOR
-        state = "disabled" if full_color else "normal"
-        self.scale_threshold.configure(state=state)
-        self.chk_smooth.configure(state=state)
         # Primary Color feeds two-tone rendering AND the border (border
         # always matches it -- see renderer.py), so it must stay enabled in
         # full-color mode whenever the border is on, even though the rest
@@ -409,8 +413,6 @@ class MatrixApp:
 
     def _on_reset(self):
         self.var_mode.set(renderer.DEFAULTS.mode)
-        self.var_threshold.set(renderer.DEFAULTS.threshold)
-        self.var_smooth.set(renderer.DEFAULTS.smooth)
         self.var_brightness.set(renderer.DEFAULTS.brightness)
         self.var_invert.set(renderer.DEFAULTS.invert)
         self.var_border.set(renderer.DEFAULTS.border)
@@ -443,6 +445,44 @@ class MatrixApp:
         if not path:
             return
         self._load_image_path(path)
+
+    def _on_generate_aruco(self):
+        aruco_dialog.ArucoDialog(self.root, self._generate_and_load_aruco)
+
+    def _generate_and_load_aruco(self, dictionary: str, marker_id: int, border_bits: int):
+        """Callback for ArucoDialog: generate the marker, save it as a
+        static PNG under images/ (so it persists as an ordinary file
+        instead of only living in memory for this session), and load it
+        the same way _on_open_image would. Lets aruco_gen's exceptions
+        propagate -- the dialog is what catches and displays those."""
+        gray = aruco_gen.generate_marker(dictionary, marker_id, border_bits=border_bits)
+        path = aruco_gen.save_marker_png(gray, dictionary, marker_id, IMAGES_DIR)
+        self._load_image_path(path, status_msg=f"Generated and saved {os.path.basename(path)}.")
+
+    def _on_save_image(self):
+        """Save the current preview (self.rgb -- full brightness, matching
+        what's on screen, see renderer.py's module docstring) as a PNG. The
+        dialog defaults into SAVED_IMAGES_DIR, but a user can still browse
+        elsewhere -- IMAGES_DIR is for source material this project ships
+        with, SAVED_IMAGES_DIR (gitignored) is a per-user scratch/export
+        spot for whatever this renders."""
+        if self.rgb is None:
+            self._set_status("No image to save.", "error")
+            return
+        os.makedirs(SAVED_IMAGES_DIR, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(self._current_image_path or "render"))[0]
+        path = filedialog.asksaveasfilename(
+            title="Save Image",
+            initialdir=SAVED_IMAGES_DIR,
+            initialfile=f"{stem}_render.png",
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("All files", "*.*")],
+            parent=self.root,
+        )
+        if not path:
+            return
+        Image.fromarray(self.rgb, "RGB").save(path)
+        self._set_status(f"Saved {os.path.basename(path)}.", "info")
 
     def _current_background(self) -> tuple:
         return self.background_color if self.var_background.get() else (0, 0, 0)
@@ -535,6 +575,19 @@ class MatrixApp:
         self.btn_connect.configure(state="normal", text=("Disconnect" if connected else "Connect"))
         self.lbl_firmware.configure(text=info if connected else "")
         self.status_dot.itemconfig(self._dot_id, fill=(DOT_CONNECTED if connected else DOT_DISCONNECTED))
+
+    def _update_send_visibility(self):
+        """The Send section (manual "Send to Matrix" + Live update) only
+        shows for a WiFi connection -- serial pushes automatically anyway
+        (connect-time sync plus Live update, which stays effectively on
+        with no visible toggle while serial-connected), so a manual send
+        control adds nothing there. Since matrix_link.py only implements
+        serial today, this section stays hidden until a WiFi transport
+        exists and _transport actually gets set to TRANSPORT_WIFI."""
+        if self._transport == status_window.TRANSPORT_WIFI:
+            self.send_frame.pack(fill="x")
+        else:
+            self.send_frame.pack_forget()
 
     # ------------------------------------------------------------------
     # Sending
@@ -675,6 +728,12 @@ class MatrixApp:
                     self._set_connected(True, payload)
                     self._set_status(f"Connected. {payload}" if payload else "Connected.", "info")
                     self.status_window.set_connected(self._connect_target, matrix_link.BAUD_RATE, payload)
+                    # Only serial exists today (see matrix_link.py) -- once
+                    # a WiFi transport is added, whichever "connect" path
+                    # created it should set TRANSPORT_WIFI instead so
+                    # _update_send_visibility can actually show Send.
+                    self._transport = status_window.TRANSPORT_SERIAL
+                    self._update_send_visibility()
                     # Push whatever's currently rendered right away, rather
                     # than leaving the panel showing nothing (or a stale
                     # frame from before a reconnect) until the user changes
@@ -684,6 +743,8 @@ class MatrixApp:
                     self._push_frame()
                 elif kind == "disconnected":
                     self._set_connected(False)
+                    self._transport = None
+                    self._update_send_visibility()
                     if payload:
                         self._set_status(f"Disconnected: {payload}", "error")
                         self._on_refresh_ports()
@@ -692,6 +753,8 @@ class MatrixApp:
                     self.status_window.set_disconnected(payload or None)
                 elif kind == "error":
                     self._set_connected(False)
+                    self._transport = None
+                    self._update_send_visibility()
                     self._set_status(f"Connection failed: {payload}", "error")
                     self._on_refresh_ports()
                     self.status_window.connect_failed(payload)
