@@ -295,9 +295,8 @@ class MatrixApp:
 
         # No color swatch of its own -- the border always matches Primary
         # Color (renderer.py resolves border_color=None to color_on).
-        self.chk_border = ttk.Checkbutton(
-            box, text="Border: OFF", variable=self.var_border,
-            style="Toolbutton", command=self._on_border_toggle)
+        self.chk_border = ttk.Checkbutton(box, text="Border", variable=self.var_border,
+                                           command=self._on_border_toggle)
         self.chk_border.pack(anchor="w", pady=(4, 0))
 
         ttk.Button(box, text="Reset to defaults", command=self._on_reset).pack(fill="x", pady=(8, 0))
@@ -403,8 +402,6 @@ class MatrixApp:
         button.configure(state=("normal" if enabled else "disabled"))
 
     def _on_border_toggle(self):
-        is_on = self.var_border.get()
-        self.chk_border.configure(text=f"Border: {'ON' if is_on else 'OFF'}")
         # Toggling border can change whether Primary Color needs to be
         # enabled in full-color mode -- see _update_control_states.
         self._update_control_states()
@@ -446,7 +443,6 @@ class MatrixApp:
         self.background_color = (0, 0, 0)
         self.btn_color_on.configure(bg=_to_hex(self.color_on))
         self.btn_background.configure(bg=_to_hex(self.background_color))
-        self.chk_border.configure(text="Border: OFF")
         self._set_swatch_enabled(self.btn_background, False)
         self._update_control_states()
         # A reload (not just a re-render) since the background may have
