@@ -89,13 +89,13 @@ DOT_CONNECTED = "#2e7d32"
 DOT_DISCONNECTED = "#888888"
 
 # which -> (state attr, button attr, color-picker dialog title, reload the
-# image source on change instead of just re-rendering). Background is the
+# image source on change instead of just re-rendering). Secondary is the
 # only entry needing a reload -- see _on_pick_color/_reload_current_image.
 # Border has no entry of its own -- it always matches "on" (see renderer.py's
 # border_color=None fallback to color_on).
 _COLOR_PICKERS = {
     "on": ("color_on", "btn_color_on", "Primary", False),
-    "background": ("background_color", "btn_background", "Background", True),
+    "secondary": ("secondary_color", "btn_secondary", "Secondary", True),
 }
 
 
@@ -113,8 +113,8 @@ class MatrixApp:
         self.img: "image_loader.LoadedImage | None" = None
         self.rgb = None                # last-rendered (H, W, 3) uint8 array
         self.color_on = renderer.DEFAULTS.color_on   # also the border color -- see renderer.py
-        self.background_color = (0, 0, 0)   # blank-pixel color when var_background is on; see _current_background()
-        self._current_image_path = None     # last successfully loaded path, for reload on background change
+        self.secondary_color = (0, 0, 0)    # blank-pixel color -- transparent PNG areas and the two-tone off color
+        self._current_image_path = None     # last successfully loaded path, for reload on secondary color change
         self._raster_cache_path = None      # path the fields below were decoded from, or None
         self._raster_cache_im = None        # decoded RGBA PIL.Image for _raster_cache_path (raster sources only)
         self._raster_cache_size = None      # its (width, height) before resizing
@@ -140,7 +140,6 @@ class MatrixApp:
         self.var_brightness = tk.IntVar(value=renderer.DEFAULTS.brightness)
         self.var_invert = tk.BooleanVar(value=renderer.DEFAULTS.invert)
         self.var_border = tk.BooleanVar(value=renderer.DEFAULTS.border)
-        self.var_background = tk.BooleanVar(value=False)
         self.var_live = tk.BooleanVar(value=True)
         self.var_aruco_dict = tk.StringVar(value=aruco_gen.DEFAULT_DICTIONARY)
         self.var_aruco_id = tk.StringVar(value="0")
@@ -272,18 +271,12 @@ class MatrixApp:
             value=renderer.FULL_COLOR, command=self._on_mode_changed)
         self.radio_full_color.pack(side="left", padx=(10, 0))
 
-        bg_row = ttk.Frame(box)
-        bg_row.pack(fill="x", pady=(8, 0))
-        self.chk_background = ttk.Checkbutton(
-            bg_row, text="Background", variable=self.var_background,
-            style="Toolbutton", command=self._on_background_toggle)
-        self.chk_background.pack(side="left")
-        self.btn_background = self._make_color_button(
-            bg_row, "background", "Color", self.background_color, fg="white", enabled=False)
-        self.btn_background.pack(side="left", padx=(6, 0))
-
         self.btn_color_on = self._make_color_button(box, "on", "Primary Color", self.color_on)
         self.btn_color_on.pack(fill="x", pady=(8, 0))
+
+        self.btn_secondary = self._make_color_button(
+            box, "secondary", "Secondary Color", self.secondary_color, fg="white")
+        self.btn_secondary.pack(fill="x", pady=(6, 0))
 
         ttk.Label(box, text="Brightness").pack(anchor="w", pady=(8, 0))
         ttk.Scale(box, from_=0, to=100, variable=self.var_brightness,
@@ -347,7 +340,7 @@ class MatrixApp:
             # default hard threshold always lands cleanly on either side.
             threshold=renderer.DEFAULTS.threshold,
             color_on=self.color_on,
-            color_off=self._current_background(),
+            color_off=self.secondary_color,
             smooth=renderer.DEFAULTS.smooth,
             brightness=int(round(self.var_brightness.get())),
             invert=self.var_invert.get(),
@@ -379,27 +372,21 @@ class MatrixApp:
         primary_enabled = (not full_color) or self.var_border.get()
         self.btn_color_on.configure(state=("normal" if primary_enabled else "disabled"))
         self.chk_invert.configure(state=("normal" if primary_enabled else "disabled"))
-        # Background always matters (transparency compositing works in
+        # Secondary Color always matters (transparency compositing works in
         # both modes), so it's never gated on `mode` here.
 
         has_color = self.img is not None and self.img.rgb is not None
         self.radio_full_color.configure(state=("normal" if has_color else "disabled"))
 
     def _make_color_button(self, parent, which: str, text: str, color: tuple,
-                            fg: str = None, enabled: bool = True) -> tk.Button:
+                            fg: str = None) -> tk.Button:
         """Build a swatch button wired to _on_pick_color(which). Only
         constructs the button -- callers still .pack() it themselves, since
         layout (fill/expand vs. a small fixed swatch) varies by call site."""
         kwargs = {"text": text, "bg": _to_hex(color), "command": lambda: self._on_pick_color(which)}
         if fg:
             kwargs["fg"] = fg
-        if not enabled:
-            kwargs["state"] = "disabled"
         return tk.Button(parent, **kwargs)
-
-    @staticmethod
-    def _set_swatch_enabled(button: tk.Button, enabled: bool):
-        button.configure(state=("normal" if enabled else "disabled"))
 
     def _on_border_toggle(self):
         # Toggling border can change whether Primary Color needs to be
@@ -438,15 +425,13 @@ class MatrixApp:
         self.var_brightness.set(renderer.DEFAULTS.brightness)
         self.var_invert.set(renderer.DEFAULTS.invert)
         self.var_border.set(renderer.DEFAULTS.border)
-        self.var_background.set(False)
         self.color_on = renderer.DEFAULTS.color_on
-        self.background_color = (0, 0, 0)
+        self.secondary_color = (0, 0, 0)
         self.btn_color_on.configure(bg=_to_hex(self.color_on))
-        self.btn_background.configure(bg=_to_hex(self.background_color))
-        self._set_swatch_enabled(self.btn_background, False)
+        self.btn_secondary.configure(bg=_to_hex(self.secondary_color))
         self._update_control_states()
-        # A reload (not just a re-render) since the background may have
-        # just changed -- see _reload_current_image.
+        # A reload (not just a re-render) since the secondary color may
+        # have just changed -- see _reload_current_image.
         self._reload_current_image("Reset to defaults.")
 
     # ------------------------------------------------------------------
@@ -517,22 +502,19 @@ class MatrixApp:
         Image.fromarray(self.rgb, "RGB").save(path)
         self._set_status(f"Saved {os.path.basename(path)}.", "info")
 
-    def _current_background(self) -> tuple:
-        return self.background_color if self.var_background.get() else (0, 0, 0)
-
     def _decode_and_composite(self, path: str) -> "image_loader.LoadedImage":
         """Like image_loader.load_image(), but caches the decoded raster
-        source per path so repeated background-color changes on the same
+        source per path so repeated secondary-color changes on the same
         image (see _reload_current_image) recomposite in memory instead of
         re-reading and re-decoding the file from disk every time."""
         ext = os.path.splitext(path)[1].lower()
         if ext not in image_loader.RASTER_EXTS:
-            return image_loader.load_image(path, background=self._current_background())
+            return image_loader.load_image(path, background=self.secondary_color)
         if self._raster_cache_path != path:
             self._raster_cache_im, self._raster_cache_size = image_loader.decode_raster(path)
             self._raster_cache_path = path
         return image_loader.composite_raster(
-            self._raster_cache_im, self._current_background(), path, self._raster_cache_size)
+            self._raster_cache_im, self.secondary_color, path, self._raster_cache_size)
 
     def _load_image_path(self, path: str, status_msg: str = None):
         try:
@@ -562,11 +544,6 @@ class MatrixApp:
         # means this only re-decodes from disk the first time per path.
         if self._current_image_path is not None:
             self._load_image_path(self._current_image_path, status_msg=status_msg)
-
-    def _on_background_toggle(self):
-        is_on = self.var_background.get()
-        self._set_swatch_enabled(self.btn_background, is_on)
-        self._reload_current_image("Background updated.")
 
     # ------------------------------------------------------------------
     # Connection
@@ -831,7 +808,7 @@ class MatrixApp:
         setattr(self, attr, rgb)
         getattr(self, btn_attr).configure(bg=hex_str)
         if reload_source:
-            self._reload_current_image("Background color updated.")
+            self._reload_current_image("Secondary color updated.")
         else:
             self._on_settings_changed()
 
