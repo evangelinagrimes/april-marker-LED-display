@@ -25,11 +25,17 @@ Rendering modes:
 - Full color: uses the source image's actual RGB values directly (only
   available when the source is a raster image -- see LoadedImage.rgb).
 
-Brightness is applied last, as a uniform scale on the final RGB output --
-not to the grayscale input -- so it can never interact with the threshold
-decision (scaling the input first could push an already-dim pixel below
-the threshold and flip it off, which would be a surprising side effect of
-"brightness").
+Brightness is deliberately its own step, apply_brightness(), instead of
+being folded into render_rgb() -- it's a uniform scale on the final RGB
+output, never on the grayscale input, so it can't interact with the
+threshold decision (scaling the input first could push an already-dim
+pixel below the threshold and flip it off, which would be a surprising
+side effect of "brightness"). Keeping it a separate step also means a
+caller can render once and choose whether a given consumer sees the
+brightness-scaled result or not -- gui.py uses this so the on-screen
+preview always shows the image at full brightness (so dimming the LEDs
+doesn't also dim your ability to see what you're sending) while the
+payload actually sent to the matrix gets the real brightness applied.
 --------------------------------------------------------------------------
 """
 
@@ -62,8 +68,8 @@ class RenderSettings:
     color_on: tuple = (255, 255, 255)
     color_off: tuple = (0, 0, 0)
     smooth: bool = False       # ramp between color_off/color_on instead of hard threshold
-    brightness: int = 100      # percent, 0-100
-    invert: bool = False       # flip every channel (255-x) on the final composed image
+    brightness: int = 100      # percent, 0-100 -- not applied by render_rgb(), see apply_brightness()
+    invert: bool = False       # swap color_on/color_off (and, via border, whichever one border_color falls back to)
     border: bool = False       # draw a 1px frame around the panel edge in border_color
     border_color: "tuple | None" = None  # None -> match color_on (the primary/on color)
 
@@ -77,6 +83,15 @@ DEFAULTS = RenderSettings()
 def render_rgb(img: LoadedImage, settings: RenderSettings) -> np.ndarray:
     """Return the (MATRIX_HEIGHT, MATRIX_WIDTH, 3) uint8 array the panel
     will display for this image under these settings."""
+    color_on, color_off = settings.color_on, settings.color_off
+    if settings.invert:
+        # Swap which of the two picked colors is "on" vs "off" (and, via
+        # border_color's None fallback below, which one the border uses)
+        # instead of negating every channel -- 255-x lands on the
+        # photographic opposite (e.g. purple becomes a washed-out green),
+        # which usually isn't the other color you actually picked.
+        color_on, color_off = color_off, color_on
+
     if settings.mode == FULL_COLOR:
         if img.rgb is None:
             raise ValueError(
@@ -85,8 +100,8 @@ def render_rgb(img: LoadedImage, settings: RenderSettings) -> np.ndarray:
             )
         rgb = img.rgb.astype(np.float32)
     else:
-        on = np.array(settings.color_on, dtype=np.float32)
-        off = np.array(settings.color_off, dtype=np.float32)
+        on = np.array(color_on, dtype=np.float32)
+        off = np.array(color_off, dtype=np.float32)
         gray = img.gray.astype(np.float32)
         if settings.smooth:
             t = (gray / 255.0)[..., None]
@@ -100,22 +115,23 @@ def render_rgb(img: LoadedImage, settings: RenderSettings) -> np.ndarray:
         # and the two arithmetic/np.where branches above all allocate) --
         # no aliasing of img.rgb or the on/off arrays, so writing into it
         # directly is safe without an extra copy.
-        border_rgb = settings.border_color if settings.border_color is not None else settings.color_on
+        border_rgb = settings.border_color if settings.border_color is not None else color_on
         border_color = np.array(border_rgb, dtype=np.float32)
         rgb[0, :, :] = border_color
         rgb[-1, :, :] = border_color
         rgb[:, 0, :] = border_color
         rgb[:, -1, :] = border_color
 
-    if settings.invert:
-        # Applied to the whole composed image (border included) rather than
-        # just the mode-derived content, so what you see in the preview --
-        # which is rendered from this exact same array -- is always exactly
-        # what gets sent, border and all.
-        rgb = 255.0 - rgb
-
-    rgb = rgb * (settings.brightness / 100.0)
     return np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
+
+
+def apply_brightness(rgb: np.ndarray, brightness: int) -> np.ndarray:
+    """Scale an already-rendered (H, W, 3) uint8 array by brightness percent
+    (0-100). Kept separate from render_rgb() -- see the module docstring --
+    so a caller can render once and apply this only to the copy headed for
+    the matrix, not the one shown on screen."""
+    scaled = rgb.astype(np.float32) * (brightness / 100.0)
+    return np.clip(scaled + 0.5, 0, 255).astype(np.uint8)
 
 
 def to_payload(rgb: np.ndarray) -> bytes:

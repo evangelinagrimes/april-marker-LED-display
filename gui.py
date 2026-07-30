@@ -57,6 +57,7 @@ from PIL import ImageTk
 import image_loader
 import matrix_link
 import renderer
+import status_window
 
 if sys.platform == "win32":
     # Tk 8.6 isn't DPI-aware on its own, which blurs the preview on a scaled
@@ -72,6 +73,8 @@ SEND_DEBOUNCE_MS = 60     # just under the ~78ms serial round trip
 EVENT_POLL_MS = 50        # how often the GUI thread drains evt_q
 CMD_POLL_TIMEOUT_S = 0.05  # how often the worker thread checks cmd_q
 WORKER_JOIN_TIMEOUT_S = 2.5
+STATUS_POLL_MS = 1000     # how often the status window's worker/queue health fields refresh
+HEARTBEAT_INTERVAL_S = 5.0  # idle-time ping cadence -- see _worker's heartbeat branch
 
 DEFAULT_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "attempt1.txt")
 
@@ -113,6 +116,7 @@ class MatrixApp:
         self._canvas_img_id = None
         self._send_job = None          # after() id for the send debounce
         self._ports_cache = []         # [(device, description), ...] from the last refresh
+        self._connect_target = None    # port passed to the worker's last "connect" cmd, for the status window
 
         # Connection state (GUI thread's mirror of the worker's real state --
         # the GUI thread never touches MatrixLink directly)
@@ -136,9 +140,11 @@ class MatrixApp:
 
         self._build_ui()
         self._auto_size_window()
+        self._build_status_window()
         self._on_refresh_ports()
         self._worker_thread.start()
         self.root.after(EVENT_POLL_MS, self._drain_events)
+        self.root.after(STATUS_POLL_MS, self._poll_status_window_health)
 
         self._load_image_path(DEFAULT_IMAGE_PATH)
 
@@ -214,19 +220,6 @@ class MatrixApp:
         box.pack(fill="x", pady=(0, 8))
         ttk.Button(box, text="Open Image...", command=self._on_open_image).pack(fill="x")
 
-        bg_row = ttk.Frame(box)
-        bg_row.pack(fill="x", pady=(8, 0))
-        self.chk_background = ttk.Checkbutton(
-            bg_row, text="Background: OFF", variable=self.var_background,
-            style="Toolbutton", command=self._on_background_toggle)
-        self.chk_background.pack(side="left")
-        self.btn_background = self._make_color_button(
-            bg_row, "background", "Color", self.background_color, fg="white", enabled=False)
-        self.btn_background.pack(side="left", padx=(6, 0))
-        ttk.Label(box, text="Color for every blank pixel -- transparent PNG areas and "
-                             "the two-tone off color. Off = those LEDs stay dark.",
-                  foreground="#666", wraplength=180).pack(anchor="w", pady=(4, 0))
-
     def _build_render(self, parent):
         box = ttk.LabelFrame(parent, text="Rendering", padding=8)
         box.pack(fill="x", pady=(0, 8))
@@ -239,6 +232,16 @@ class MatrixApp:
             mode_row, text="Full color", variable=self.var_mode,
             value=renderer.FULL_COLOR, command=self._on_mode_changed)
         self.radio_full_color.pack(side="left", padx=(10, 0))
+
+        bg_row = ttk.Frame(box)
+        bg_row.pack(fill="x", pady=(8, 0))
+        self.chk_background = ttk.Checkbutton(
+            bg_row, text="Background", variable=self.var_background,
+            style="Toolbutton", command=self._on_background_toggle)
+        self.chk_background.pack(side="left")
+        self.btn_background = self._make_color_button(
+            bg_row, "background", "Color", self.background_color, fg="white", enabled=False)
+        self.btn_background.pack(side="left", padx=(6, 0))
 
         self.lbl_threshold = ttk.Label(box, text="Threshold")
         self.lbl_threshold.pack(anchor="w", pady=(8, 0))
@@ -292,6 +295,17 @@ class MatrixApp:
         self.lbl_status = ttk.Label(parent, text="Ready.", relief="sunken", anchor="w", padding=(6, 3))
         self.lbl_status.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
+    def _build_status_window(self):
+        self.status_window = status_window.StatusWindow(self.root)
+        # Place it beside the main window rather than stacked on top of it,
+        # so both are visible at once without the user having to drag one
+        # aside first -- the whole point of a status monitor is watching it
+        # while you use the main controls.
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + self.root.winfo_width() + 12
+        y = self.root.winfo_y()
+        self.status_window.win.geometry(f"+{x}+{y}")
+
     # ------------------------------------------------------------------
     # Rendering / preview
     # ------------------------------------------------------------------
@@ -329,9 +343,14 @@ class MatrixApp:
         # Primary Color feeds two-tone rendering AND the border (border
         # always matches it -- see renderer.py), so it must stay enabled in
         # full-color mode whenever the border is on, even though the rest
-        # of the two-tone controls above are disabled there.
+        # of the two-tone controls above are disabled there. Invert (which
+        # now swaps color_on/color_off rather than negating the image, see
+        # renderer.py) only has any visible effect under that same
+        # condition -- full-color pixels themselves don't come from
+        # color_on/color_off at all.
         primary_enabled = (not full_color) or self.var_border.get()
         self.btn_color_on.configure(state=("normal" if primary_enabled else "disabled"))
+        self.chk_invert.configure(state=("normal" if primary_enabled else "disabled"))
         # Background always matters (transparency compositing works in
         # both modes), so it's never gated on `mode` here.
 
@@ -400,7 +419,6 @@ class MatrixApp:
         self.background_color = (0, 0, 0)
         self.btn_color_on.configure(bg=_to_hex(self.color_on))
         self.btn_background.configure(bg=_to_hex(self.background_color))
-        self.chk_background.configure(text="Background: OFF")
         self.chk_border.configure(text="Border: OFF")
         self._set_swatch_enabled(self.btn_background, False)
         self._update_control_states()
@@ -474,7 +492,6 @@ class MatrixApp:
 
     def _on_background_toggle(self):
         is_on = self.var_background.get()
-        self.chk_background.configure(text=f"Background: {'ON' if is_on else 'OFF'}")
         self._set_swatch_enabled(self.btn_background, is_on)
         self._reload_current_image("Background updated.")
 
@@ -509,6 +526,8 @@ class MatrixApp:
             return
         self.btn_connect.configure(state="disabled")
         self._set_status(f"Connecting to {port}...", "info")
+        self._connect_target = port
+        self.status_window.set_connecting(port, matrix_link.BAUD_RATE)
         self.cmd_q.put(("connect", port))
 
     def _set_connected(self, connected: bool, info: str = ""):
@@ -536,7 +555,12 @@ class MatrixApp:
         if payload is None:
             if self.rgb is None or not self.connected:
                 return
-            payload = renderer.to_payload(self.rgb)
+            # Brightness is applied here, to the payload only -- self.rgb
+            # (and the preview drawn from it) stays at full brightness so
+            # dimming the LEDs doesn't also dim your ability to see what
+            # you're sending. See renderer.py's module docstring.
+            out = renderer.apply_brightness(self.rgb, int(round(self.var_brightness.get())))
+            payload = renderer.to_payload(out)
         # Latest-wins: drop whatever's queued before adding the new one, so
         # the worker never sends a stale frame from mid-drag (see module
         # docstring).
@@ -561,6 +585,7 @@ class MatrixApp:
 
     def _worker(self):
         link = None
+        last_activity = 0.0  # time.monotonic() of the last successful send/ping -- drives the idle heartbeat below
         while True:
             try:
                 cmd, arg = self.cmd_q.get(timeout=CMD_POLL_TIMEOUT_S)
@@ -593,6 +618,7 @@ class MatrixApp:
                     if fw_id is None:
                         time.sleep(matrix_link.BOOT_SETTLE_S)
                         fw_id = link.ping()
+                    last_activity = time.monotonic()
                     if fw_id is None:
                         self.evt_q.put(("connected", ""))
                         self.evt_q.put(("warning",
@@ -614,14 +640,32 @@ class MatrixApp:
                 try:
                     payload = self.frame_q.get_nowait()
                 except queue.Empty:
-                    continue
-                try:
-                    ack = link.send_rgb(payload)
-                    self.evt_q.put(("ack", ack or ""))
-                except matrix_link.MatrixLinkError as e:
-                    link.close()
-                    link = None
-                    self.evt_q.put(("disconnected", str(e)))
+                    payload = None
+
+                if payload is not None:
+                    try:
+                        ack = link.send_rgb(payload)
+                        last_activity = time.monotonic()
+                        self.evt_q.put(("ack", ack or ""))
+                    except matrix_link.MatrixLinkError as e:
+                        link.close()
+                        link = None
+                        self.evt_q.put(("disconnected", str(e)))
+                elif time.monotonic() - last_activity >= HEARTBEAT_INTERVAL_S:
+                    # Nothing queued to send -- ping anyway so a silent USB
+                    # unplug or a hung board shows up within one interval
+                    # instead of only the next time a frame goes out. A
+                    # missing reply alone isn't fatal (see MatrixLink.ping()
+                    # -- the board may just be busy); only an actual I/O
+                    # failure means the connection is really gone.
+                    try:
+                        fw_id = link.ping()
+                        last_activity = time.monotonic()
+                        self.evt_q.put(("heartbeat", fw_id or ""))
+                    except matrix_link.MatrixLinkError as e:
+                        link.close()
+                        link = None
+                        self.evt_q.put(("disconnected", str(e)))
 
     def _drain_events(self):
         try:
@@ -630,6 +674,14 @@ class MatrixApp:
                 if kind == "connected":
                     self._set_connected(True, payload)
                     self._set_status(f"Connected. {payload}" if payload else "Connected.", "info")
+                    self.status_window.set_connected(self._connect_target, matrix_link.BAUD_RATE, payload)
+                    # Push whatever's currently rendered right away, rather
+                    # than leaving the panel showing nothing (or a stale
+                    # frame from before a reconnect) until the user changes
+                    # a setting or hits Send -- independent of "Live update",
+                    # which only governs pushes made *while* dragging a
+                    # slider, not this one-shot sync-on-connect.
+                    self._push_frame()
                 elif kind == "disconnected":
                     self._set_connected(False)
                     if payload:
@@ -637,17 +689,33 @@ class MatrixApp:
                         self._on_refresh_ports()
                     else:
                         self._set_status("Disconnected.", "info")
+                    self.status_window.set_disconnected(payload or None)
                 elif kind == "error":
                     self._set_connected(False)
                     self._set_status(f"Connection failed: {payload}", "error")
                     self._on_refresh_ports()
+                    self.status_window.connect_failed(payload)
                 elif kind == "warning":
                     self._set_status(payload, "warning")
+                    self.status_window.set_warning(payload)
                 elif kind == "ack":
                     self._set_status(f"Sent. ESP32: {payload}" if payload else "Sent (no response).", "info")
+                    self.status_window.record_ack(payload)
+                elif kind == "heartbeat":
+                    self.status_window.record_heartbeat(payload)
         except queue.Empty:
             pass
         self.root.after(EVENT_POLL_MS, self._drain_events)
+
+    def _poll_status_window_health(self):
+        # qsize() is inherently racy against the worker thread, but this is
+        # a debug display, not a control-flow decision -- an occasional
+        # off-by-one is fine, and it still catches the two things that
+        # actually matter: the worker thread dying, and a frame sitting
+        # queued longer than expected.
+        self.status_window.set_worker_alive(self._worker_thread.is_alive())
+        self.status_window.set_queue_depth(self.frame_q.qsize())
+        self.root.after(STATUS_POLL_MS, self._poll_status_window_health)
 
     # ------------------------------------------------------------------
     # Misc

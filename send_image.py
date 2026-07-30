@@ -107,7 +107,7 @@ def parse_args(argv=None):
         metavar="0-100", help="output brightness percent, applied last (default: %(default)s)")
     parser.add_argument(
         "--invert", action="store_true",
-        help="invert every channel (255-x) of the final composed image before sending")
+        help="swap --color-on and --color-off (and whichever one the border falls back to)")
     parser.add_argument(
         "--border", action="store_true",
         help="draw a 1px border around the panel edge in --border-color")
@@ -162,6 +162,7 @@ def main(argv=None) -> int:
         print(f"Error: {e}")
         return 1
 
+    rgb = renderer.apply_brightness(rgb, args.brightness)
     payload = renderer.to_payload(rgb)
 
     try:
