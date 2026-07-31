@@ -593,6 +593,14 @@ class MatrixApp:
 
     def _on_toggle_connection(self):
         if self.connected:
+            # Blank the panel on the way out instead of leaving it showing
+            # whatever was last sent -- same reasoning as _on_close's
+            # blank-on-exit frame. Cancel any pending debounced send first
+            # so a still-in-flight slider drag can't re-queue a non-blank
+            # frame after this one, the same race _on_close avoids too.
+            if self._send_job is not None:
+                self.root.after_cancel(self._send_job)
+            self._push_frame(renderer.blank_payload())
             self.cmd_q.put(("disconnect", None))
             return
         port = self._selected_port()
@@ -720,7 +728,15 @@ class MatrixApp:
 
             elif cmd == "disconnect":
                 if link is not None:
-                    link.close()
+                    # Best-effort: send whatever's queued (the GUI queues a
+                    # blank frame right before this command -- see
+                    # _on_toggle_connection) so the panel goes dark on
+                    # disconnect instead of showing the last image forever.
+                    try:
+                        payload = self.frame_q.get_nowait()
+                    except queue.Empty:
+                        payload = None
+                    link.close(final_payload=payload)
                     link = None
                 self.evt_q.put(("disconnected", ""))
 
