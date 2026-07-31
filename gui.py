@@ -90,7 +90,7 @@ DOT_DISCONNECTED = "#888888"
 
 # which -> (state attr, button attr, color-picker dialog title, reload the
 # image source on change instead of just re-rendering). Secondary is the
-# only entry needing a reload -- see _on_pick_color/_reload_current_image.
+# only entry needing a reload -- see _on_pick_color/_reload_or_rerender.
 # Border has no entry of its own -- it always matches "on" (see renderer.py's
 # border_color=None fallback to color_on).
 _COLOR_PICKERS = {
@@ -114,7 +114,10 @@ class MatrixApp:
         self.rgb = None                # last-rendered (H, W, 3) uint8 array
         self.color_on = renderer.DEFAULTS.color_on   # also the border color -- see renderer.py
         self.secondary_color = (0, 0, 0)    # blank-pixel color -- transparent PNG areas and the two-tone off color
-        self._current_image_path = None     # last successfully loaded path, for reload on secondary color change
+        self._current_image_path = None     # last successfully loaded path, for reload on secondary color change --
+                                             # None if the current image (e.g. a just-generated, not-yet-saved ArUco
+                                             # marker) has no backing file; see _reload_or_rerender/_on_generate_aruco
+        self._current_image_name = None     # display/save-suggestion name -- set even when _current_image_path isn't
         self._raster_cache_path = None      # path the fields below were decoded from, or None
         self._raster_cache_im = None        # decoded RGBA PIL.Image for _raster_cache_path (raster sources only)
         self._raster_cache_size = None      # its (width, height) before resizing
@@ -431,8 +434,8 @@ class MatrixApp:
         self.btn_secondary.configure(bg=_to_hex(self.secondary_color))
         self._update_control_states()
         # A reload (not just a re-render) since the secondary color may
-        # have just changed -- see _reload_current_image.
-        self._reload_current_image("Reset to defaults.")
+        # have just changed -- see _reload_or_rerender.
+        self._reload_or_rerender("Reset to defaults.")
 
     # ------------------------------------------------------------------
     # Image loading
@@ -458,9 +461,9 @@ class MatrixApp:
 
     def _on_generate_aruco(self):
         """Read the inline dictionary/ID/border fields, generate the
-        marker, save it as a static PNG under images/ (so it persists as
-        an ordinary file instead of only living in memory for this
-        session), and load it the same way _on_open_image would."""
+        marker, and load it into the preview/render pipeline the same way
+        _on_open_image would -- but purely in memory. Nothing is written to
+        disk here; that only happens if/when Save Image is pressed."""
         try:
             marker_id = int(self.var_aruco_id.get())
             border_bits = int(self.var_aruco_border.get())
@@ -474,8 +477,13 @@ class MatrixApp:
         except aruco_gen.ArucoGenError as e:
             messagebox.showerror("Could not generate marker", str(e), parent=self.root)
             return
-        path = aruco_gen.save_marker_png(gray, dictionary, marker_id, IMAGES_DIR)
-        self._load_image_path(path, status_msg=f"Generated and saved {os.path.basename(path)}.")
+        img = image_loader.LoadedImage(gray=gray, rgb=None, path=None,
+                                        source_size=(gray.shape[1], gray.shape[0]))
+        self._current_image_path = None  # nothing on disk -- see _reload_or_rerender
+        self._current_image_name = f"aruco_{dictionary}_id{marker_id}.png"
+        self._set_current_image(
+            img, f"{self._current_image_name} (not saved)",
+            f"Generated {dictionary} id {marker_id} -- press Save Image to keep it.")
 
     def _on_save_image(self):
         """Save the current preview (self.rgb -- full brightness, matching
@@ -488,7 +496,7 @@ class MatrixApp:
             self._set_status("No image to save.", "error")
             return
         os.makedirs(SAVED_IMAGES_DIR, exist_ok=True)
-        stem = os.path.splitext(os.path.basename(self._current_image_path or "render"))[0]
+        stem = os.path.splitext(self._current_image_name or "render")[0]
         path = filedialog.asksaveasfilename(
             title="Save Image",
             initialdir=SAVED_IMAGES_DIR,
@@ -505,7 +513,7 @@ class MatrixApp:
     def _decode_and_composite(self, path: str) -> "image_loader.LoadedImage":
         """Like image_loader.load_image(), but caches the decoded raster
         source per path so repeated secondary-color changes on the same
-        image (see _reload_current_image) recomposite in memory instead of
+        image (see _reload_or_rerender) recomposite in memory instead of
         re-reading and re-decoding the file from disk every time."""
         ext = os.path.splitext(path)[1].lower()
         if ext not in image_loader.RASTER_EXTS:
@@ -515,6 +523,19 @@ class MatrixApp:
             self._raster_cache_path = path
         return image_loader.composite_raster(
             self._raster_cache_im, self.secondary_color, path, self._raster_cache_size)
+
+    def _set_current_image(self, img: "image_loader.LoadedImage", display_name: str, status_msg: str):
+        """Apply a decoded/generated LoadedImage as what's currently shown
+        and sent -- shared by _load_image_path (a real file) and
+        _on_generate_aruco (purely in-memory, no file involved)."""
+        self.img = img
+        self.lbl_image_path.configure(text=display_name)
+        self.lbl_image_info.configure(text=f"{img.source_size[0]}x{img.source_size[1]} source")
+        if img.rgb is None and self.var_mode.get() == renderer.FULL_COLOR:
+            self.var_mode.set(renderer.TWO_TONE)
+        self._update_control_states()
+        self._on_settings_changed()
+        self._set_status(status_msg, "info")
 
     def _load_image_path(self, path: str, status_msg: str = None):
         try:
@@ -526,24 +547,28 @@ class MatrixApp:
             self._set_status(f"Could not load {os.path.basename(path)}: {e}", "error")
             return
 
-        self.img = img
         self._current_image_path = path
-        self.lbl_image_path.configure(text=os.path.basename(path))
-        self.lbl_image_info.configure(text=f"{img.source_size[0]}x{img.source_size[1]} source")
-        if img.rgb is None and self.var_mode.get() == renderer.FULL_COLOR:
-            self.var_mode.set(renderer.TWO_TONE)
-        self._update_control_states()
-        self._on_settings_changed()
-        self._set_status(status_msg or f"Loaded {os.path.basename(path)}.", "info")
+        self._current_image_name = os.path.basename(path)
+        self._set_current_image(img, self._current_image_name,
+                                 status_msg or f"Loaded {self._current_image_name}.")
 
-    def _reload_current_image(self, status_msg: str = None):
-        # Background compositing needs the original alpha channel, which is
-        # gone once .img is cached as flattened RGB -- so a background
-        # change has to recomposite from the source rather than just
-        # re-render like other settings. _decode_and_composite's cache
-        # means this only re-decodes from disk the first time per path.
+    def _reload_or_rerender(self, status_msg: str):
+        """Secondary-color changes need to recomposite from the source
+        file, not just re-render, whenever the current image has one --
+        raster compositing needs the original alpha channel, which is gone
+        once .img is cached as flattened RGB (_decode_and_composite's cache
+        means this only re-decodes from disk the first time per path).
+
+        But the current image might not have a backing file at all (an
+        ArUco marker fresh out of _on_generate_aruco, not yet saved) -- for
+        those there's nothing to recomposite (no alpha, no file), so just
+        re-render in place instead; the secondary color already feeds
+        render_rgb() live either way."""
         if self._current_image_path is not None:
             self._load_image_path(self._current_image_path, status_msg=status_msg)
+        else:
+            self._on_settings_changed()
+            self._set_status(status_msg, "info")
 
     # ------------------------------------------------------------------
     # Connection
@@ -808,7 +833,7 @@ class MatrixApp:
         setattr(self, attr, rgb)
         getattr(self, btn_attr).configure(bg=hex_str)
         if reload_source:
-            self._reload_current_image("Secondary color updated.")
+            self._reload_or_rerender("Secondary color updated.")
         else:
             self._on_settings_changed()
 
