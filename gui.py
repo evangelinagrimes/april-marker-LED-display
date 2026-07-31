@@ -73,7 +73,8 @@ PREVIEW_SCALE = 24        # on-screen pixels per matrix pixel
 SEND_DEBOUNCE_MS = 60     # just under the ~78ms serial round trip
 EVENT_POLL_MS = 50        # how often the GUI thread drains evt_q
 CMD_POLL_TIMEOUT_S = 0.05  # how often the worker thread checks cmd_q
-WORKER_JOIN_TIMEOUT_S = 2.5
+WORKER_JOIN_TIMEOUT_S = 5.0  # above the worst-case in-flight connect: two ACK_TIMEOUT_S pings
+                              # either side of matrix_link.BOOT_SETTLE_S's 2s sleep, plus margin
 STATUS_POLL_MS = 1000     # how often the status window's worker/queue health fields refresh
 HEARTBEAT_INTERVAL_S = 5.0  # idle-time ping cadence -- see _worker's heartbeat branch
 
@@ -118,8 +119,10 @@ class MatrixApp:
                                              # None if the current image (e.g. a just-generated, not-yet-saved ArUco
                                              # marker) has no backing file; see _reload_or_rerender/_on_generate_aruco
         self._current_image_name = None     # display/save-suggestion name -- set even when _current_image_path isn't
-        self._raster_cache_path = None      # path the fields below were decoded from, or None
-        self._raster_cache_im = None        # decoded RGBA PIL.Image for _raster_cache_path (raster sources only)
+        self._raster_cache_key = None       # (path, mtime_ns, size) the fields below were decoded from, or None --
+                                             # includes mtime/size (not just path) so overwriting a file on disk
+                                             # (e.g. Save Image over an already-open source) invalidates the cache
+        self._raster_cache_im = None        # decoded RGBA PIL.Image for _raster_cache_key (raster sources only)
         self._raster_cache_size = None      # its (width, height) before resizing
         self._photo = None             # must stay referenced or PhotoImage goes blank
         self._canvas_img_id = None
@@ -295,6 +298,11 @@ class MatrixApp:
                                            command=self._on_border_toggle)
         self.chk_border.pack(anchor="w", pady=(4, 0))
 
+        # Lives here rather than in the Send section (which is hidden
+        # unless connected via WiFi -- see _update_send_visibility) so the
+        # setting stays user-controllable regardless of transport.
+        ttk.Checkbutton(box, text="Live update", variable=self.var_live).pack(anchor="w", pady=(4, 0))
+
         ttk.Button(box, text="Reset to defaults", command=self._on_reset).pack(fill="x", pady=(8, 0))
 
     def _build_send(self, parent):
@@ -302,23 +310,29 @@ class MatrixApp:
         box.pack(fill="x")
         self.send_frame = box  # shown/hidden by _update_send_visibility
 
-        send_row = ttk.Frame(box)
-        send_row.pack(fill="x")
-        # Always clickable -- _on_send reports "not connected"/"no image" via
-        # the status bar rather than the button just going dead, and this dot
-        # is the always-visible complement: green means a click will actually
-        # do something, gray means it won't.
-        self.status_dot = tk.Canvas(send_row, width=14, height=14, highlightthickness=0)
-        self.status_dot.pack(side="left", padx=(0, 6))
-        self._dot_id = self.status_dot.create_oval(2, 2, 12, 12, fill=DOT_DISCONNECTED, outline="")
-        self.btn_send = ttk.Button(send_row, text="Send to Matrix", command=self._on_send)
-        self.btn_send.pack(side="left", fill="x", expand=True)
-
-        ttk.Checkbutton(box, text="Live update", variable=self.var_live).pack(anchor="w", pady=(6, 0))
+        # _on_send reports "not connected"/"no image" via the status bar
+        # rather than the button just going dead, so it's always clickable.
+        # The connection status dot lives in the status bar now, not here --
+        # it needs to stay visible even while this section is hidden (see
+        # _update_send_visibility).
+        self.btn_send = ttk.Button(box, text="Send to Matrix", command=self._on_send)
+        self.btn_send.pack(fill="x")
 
     def _build_statusbar(self, parent):
-        self.lbl_status = ttk.Label(parent, text="Ready.", relief="sunken", anchor="w", padding=(6, 3))
-        self.lbl_status.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        row = ttk.Frame(parent)
+        row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        row.columnconfigure(1, weight=1)
+
+        # Green while connected, gray otherwise -- the at-a-glance version
+        # of the status text next to it. Lives here (rather than inside the
+        # Send section) so it stays visible even though Send itself is
+        # hidden unless connected via WiFi (see _update_send_visibility).
+        self.status_dot = tk.Canvas(row, width=14, height=14, highlightthickness=0)
+        self.status_dot.grid(row=0, column=0, padx=(0, 6))
+        self._dot_id = self.status_dot.create_oval(2, 2, 12, 12, fill=DOT_DISCONNECTED, outline="")
+
+        self.lbl_status = ttk.Label(row, text="Ready.", relief="sunken", anchor="w", padding=(6, 3))
+        self.lbl_status.grid(row=0, column=1, sticky="ew")
 
     def _build_status_window(self):
         self.status_window = status_window.StatusWindow(self.root)
@@ -456,8 +470,11 @@ class MatrixApp:
         self._load_image_path(path)
 
     def _update_aruco_range_label(self):
-        size = aruco_gen.dictionary_size(self.var_aruco_dict.get())
-        self.lbl_aruco_range.configure(text=f"Valid IDs: 0-{size - 1}")
+        dictionary = self.var_aruco_dict.get()
+        size = aruco_gen.dictionary_size(dictionary)
+        max_border = aruco_gen.max_border_bits(dictionary)
+        self.lbl_aruco_range.configure(
+            text=f"Valid IDs: 0-{size - 1}  |  Border bits: 1-{max_border}")
 
     def _on_generate_aruco(self):
         """Read the inline dictionary/ID/border fields, generate the
@@ -495,7 +512,13 @@ class MatrixApp:
         if self.rgb is None:
             self._set_status("No image to save.", "error")
             return
-        os.makedirs(SAVED_IMAGES_DIR, exist_ok=True)
+        try:
+            os.makedirs(SAVED_IMAGES_DIR, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Could not save image", f"Could not create {SAVED_IMAGES_DIR}: {e}",
+                                  parent=self.root)
+            self._set_status(f"Could not save: {e}", "error")
+            return
         stem = os.path.splitext(self._current_image_name or "render")[0]
         path = filedialog.asksaveasfilename(
             title="Save Image",
@@ -507,8 +530,24 @@ class MatrixApp:
         )
         if not path:
             return
-        Image.fromarray(self.rgb, "RGB").save(path)
-        self._set_status(f"Saved {os.path.basename(path)}.", "info")
+        try:
+            Image.fromarray(self.rgb, "RGB").save(path)
+        except (OSError, ValueError, KeyError) as e:
+            # OSError: disk full, permission denied, locked by another
+            # program. ValueError/KeyError: Pillow can't infer a format --
+            # reachable since the dialog's "All files" filter (above) lets
+            # someone type an unrecognized extension past defaultextension.
+            messagebox.showerror("Could not save image", str(e), parent=self.root)
+            self._set_status(f"Could not save {os.path.basename(path)}: {e}", "error")
+            return
+        # Update the displayed name so a just-generated-and-saved marker's
+        # "(not saved)" label (see _on_generate_aruco) reflects reality --
+        # deliberately NOT touching _current_image_path, since this file
+        # holds a fully rendered/colorized output, not source material
+        # _reload_or_rerender could safely recomposite from.
+        self._current_image_name = os.path.basename(path)
+        self.lbl_image_path.configure(text=self._current_image_name)
+        self._set_status(f"Saved {self._current_image_name}.", "info")
 
     def _decode_and_composite(self, path: str) -> "image_loader.LoadedImage":
         """Like image_loader.load_image(), but caches the decoded raster
@@ -518,9 +557,19 @@ class MatrixApp:
         ext = os.path.splitext(path)[1].lower()
         if ext not in image_loader.RASTER_EXTS:
             return image_loader.load_image(path, background=self.secondary_color)
-        if self._raster_cache_path != path:
+        try:
+            stat = os.stat(path)
+        except OSError as e:
+            raise image_loader.ImageLoadError(str(e)) from e
+        # Keyed on mtime/size, not just path -- e.g. Generate ArUco id 0,
+        # Save Image over marker.png, Open Image marker.png (decodes,
+        # caches), Generate id 5, Save over marker.png again, Open
+        # marker.png again: a path-only key would skip the re-decode and
+        # keep showing/sending id 0's pixels under id 5's filename.
+        cache_key = (path, stat.st_mtime_ns, stat.st_size)
+        if self._raster_cache_key != cache_key:
             self._raster_cache_im, self._raster_cache_size = image_loader.decode_raster(path)
-            self._raster_cache_path = path
+            self._raster_cache_key = cache_key
         return image_loader.composite_raster(
             self._raster_cache_im, self.secondary_color, path, self._raster_cache_size)
 
@@ -601,6 +650,11 @@ class MatrixApp:
             if self._send_job is not None:
                 self.root.after_cancel(self._send_job)
             self._push_frame(renderer.blank_payload())
+            # Disabled until _set_connected(False) re-enables it on the
+            # actual "disconnected" event -- otherwise a double-click queues
+            # two blank frames and two "disconnect" commands before the
+            # worker processes the first.
+            self.btn_connect.configure(state="disabled")
             self.cmd_q.put(("disconnect", None))
             return
         port = self._selected_port()
@@ -689,147 +743,206 @@ class MatrixApp:
                 cmd, arg = None, None
 
             if cmd == "quit":
-                if link is not None:
-                    # Best-effort: send whatever's queued (the GUI queues a
-                    # blank frame right before this command -- see
-                    # _on_close) so the panel goes dark on exit instead of
-                    # showing the last image forever. MatrixLink.close()
-                    # does the send-then-close itself, swallowing failures
-                    # the same way ping()'s timeout already is elsewhere.
-                    try:
-                        payload = self.frame_q.get_nowait()
-                    except queue.Empty:
-                        payload = None
-                    link.close(final_payload=payload)
+                try:
+                    if link is not None:
+                        # Best-effort: send whatever's queued (the GUI
+                        # queues a blank frame right before this command --
+                        # see _on_close) so the panel goes dark on exit
+                        # instead of showing the last image forever.
+                        # MatrixLink.close() does the send-then-close
+                        # itself, swallowing failures the same way
+                        # ping()'s timeout already is elsewhere -- the
+                        # outer except is only a backstop for anything that
+                        # isn't, so the thread still exits either way.
+                        try:
+                            payload = self.frame_q.get_nowait()
+                        except queue.Empty:
+                            payload = None
+                        link.close(final_payload=payload)
+                except Exception:
+                    pass
                 return
 
-            elif cmd == "connect":
-                if link is not None:
-                    link.close()
-                    link = None
-                try:
-                    link = matrix_link.MatrixLink(arg)
-                    link.open()
-                    fw_id = link.ping()
-                    if fw_id is None:
-                        time.sleep(matrix_link.BOOT_SETTLE_S)
+            # Anything below that isn't already caught by its own
+            # `except matrix_link.MatrixLinkError` (e.g. matrix_link.py's
+            # build_frame raising ValueError for a wrong-length payload)
+            # would otherwise kill this thread silently: self.connected
+            # would freeze at its last value, the Connect/Disconnect button
+            # would lie, frame_q would fill and quietly drop every frame
+            # after, and the only visible sign would be the debug window's
+            # "Worker thread: Dead" field. Reset to a clean, truthful
+            # disconnected state and keep the thread (and a future
+            # reconnect) alive instead of returning.
+            try:
+                if cmd == "connect":
+                    if link is not None:
+                        link.close()
+                        link = None
+                    try:
+                        link = matrix_link.MatrixLink(arg)
+                        link.open()
                         fw_id = link.ping()
-                    last_activity = time.monotonic()
-                    if fw_id is None:
-                        self.evt_q.put(("connected", ""))
-                        self.evt_q.put(("warning",
-                                         "Port open, but the firmware didn't answer -- "
-                                         "is it flashed with the RGB firmware?"))
-                    else:
-                        self.evt_q.put(("connected", fw_id))
-                except matrix_link.MatrixLinkError as e:
-                    link = None
-                    self.evt_q.put(("error", str(e)))
+                        if fw_id is None:
+                            time.sleep(matrix_link.BOOT_SETTLE_S)
+                            fw_id = link.ping()
+                        last_activity = time.monotonic()
+                        if fw_id is None:
+                            self.evt_q.put(("connected", ""))
+                            self.evt_q.put(("warning",
+                                             "Port open, but the firmware didn't answer -- "
+                                             "is it flashed with the RGB firmware?"))
+                        else:
+                            self.evt_q.put(("connected", fw_id))
+                    except matrix_link.MatrixLinkError as e:
+                        # open() can succeed and then ping() fail (board
+                        # unplugged mid-BOOT_SETTLE_S, driver hiccup) --
+                        # close whatever got opened rather than dropping
+                        # the reference and leaking the OS port handle,
+                        # which would make the next Connect attempt fail
+                        # with "Access is denied" and read as a hardware
+                        # problem.
+                        if link is not None:
+                            link.close()
+                        link = None
+                        self.evt_q.put(("error", str(e)))
 
-            elif cmd == "disconnect":
-                if link is not None:
-                    # Best-effort: send whatever's queued (the GUI queues a
-                    # blank frame right before this command -- see
-                    # _on_toggle_connection) so the panel goes dark on
-                    # disconnect instead of showing the last image forever.
+                elif cmd == "disconnect":
+                    if link is not None:
+                        # Best-effort: send whatever's queued (the GUI queues a
+                        # blank frame right before this command -- see
+                        # _on_toggle_connection) so the panel goes dark on
+                        # disconnect instead of showing the last image forever.
+                        try:
+                            payload = self.frame_q.get_nowait()
+                        except queue.Empty:
+                            payload = None
+                        link.close(final_payload=payload)
+                        link = None
+                        self.evt_q.put(("disconnected", ""))
+                    # else: link was already None, which only happens after
+                    # something already reported a "disconnected"/"error"
+                    # event -- don't emit a second one with no reason (see
+                    # _on_toggle_connection's disable-on-click guard, which
+                    # is the other half of preventing this).
+
+                if link is not None and link.is_open:
                     try:
                         payload = self.frame_q.get_nowait()
                     except queue.Empty:
                         payload = None
-                    link.close(final_payload=payload)
+
+                    if payload is not None:
+                        try:
+                            ack = link.send_rgb(payload)
+                            last_activity = time.monotonic()
+                            self.evt_q.put(("ack", ack or ""))
+                        except matrix_link.MatrixLinkError as e:
+                            link.close()
+                            link = None
+                            self.evt_q.put(("disconnected", str(e)))
+                    elif time.monotonic() - last_activity >= HEARTBEAT_INTERVAL_S:
+                        # Nothing queued to send -- ping anyway so a silent USB
+                        # unplug or a hung board shows up within one interval
+                        # instead of only the next time a frame goes out. A
+                        # missing reply alone isn't fatal (see MatrixLink.ping()
+                        # -- the board may just be busy); only an actual I/O
+                        # failure means the connection is really gone.
+                        try:
+                            fw_id = link.ping()
+                            last_activity = time.monotonic()
+                            self.evt_q.put(("heartbeat", fw_id or ""))
+                        except matrix_link.MatrixLinkError as e:
+                            link.close()
+                            link = None
+                            self.evt_q.put(("disconnected", str(e)))
+            except Exception as e:
+                if link is not None:
+                    try:
+                        link.close()
+                    except Exception:
+                        pass
                     link = None
-                self.evt_q.put(("disconnected", ""))
-
-            if link is not None and link.is_open:
-                try:
-                    payload = self.frame_q.get_nowait()
-                except queue.Empty:
-                    payload = None
-
-                if payload is not None:
-                    try:
-                        ack = link.send_rgb(payload)
-                        last_activity = time.monotonic()
-                        self.evt_q.put(("ack", ack or ""))
-                    except matrix_link.MatrixLinkError as e:
-                        link.close()
-                        link = None
-                        self.evt_q.put(("disconnected", str(e)))
-                elif time.monotonic() - last_activity >= HEARTBEAT_INTERVAL_S:
-                    # Nothing queued to send -- ping anyway so a silent USB
-                    # unplug or a hung board shows up within one interval
-                    # instead of only the next time a frame goes out. A
-                    # missing reply alone isn't fatal (see MatrixLink.ping()
-                    # -- the board may just be busy); only an actual I/O
-                    # failure means the connection is really gone.
-                    try:
-                        fw_id = link.ping()
-                        last_activity = time.monotonic()
-                        self.evt_q.put(("heartbeat", fw_id or ""))
-                    except matrix_link.MatrixLinkError as e:
-                        link.close()
-                        link = None
-                        self.evt_q.put(("disconnected", str(e)))
+                self.evt_q.put(("disconnected", f"internal error: {e}"))
 
     def _drain_events(self):
+        # The reschedule is in `finally` -- and each event's handling is its
+        # own try -- so neither an unexpected exception from a handler nor
+        # one bad event can stop this from being called again. Without that,
+        # this is the GUI thread's only connection to evt_q (see module
+        # docstring): if it stops rescheduling, connection status, acks,
+        # warnings, and disconnects silently stop updating for the rest of
+        # the session, with the Connect/Disconnect button frozen on
+        # whatever it last said and no visible sign anything is wrong.
         try:
             while True:
-                kind, payload = self.evt_q.get_nowait()
-                if kind == "connected":
-                    self._set_connected(True, payload)
-                    self._set_status(f"Connected. {payload}" if payload else "Connected.", "info")
-                    self.status_window.set_connected(self._connect_target, matrix_link.BAUD_RATE, payload)
-                    # Only serial exists today (see matrix_link.py) -- once
-                    # a WiFi transport is added, whichever "connect" path
-                    # created it should set TRANSPORT_WIFI instead so
-                    # _update_send_visibility can actually show Send.
-                    self._transport = status_window.TRANSPORT_SERIAL
-                    self._update_send_visibility()
-                    # Push whatever's currently rendered right away, rather
-                    # than leaving the panel showing nothing (or a stale
-                    # frame from before a reconnect) until the user changes
-                    # a setting or hits Send -- independent of "Live update",
-                    # which only governs pushes made *while* dragging a
-                    # slider, not this one-shot sync-on-connect.
-                    self._push_frame()
-                elif kind == "disconnected":
-                    self._set_connected(False)
-                    self._transport = None
-                    self._update_send_visibility()
-                    if payload:
-                        self._set_status(f"Disconnected: {payload}", "error")
-                        self._on_refresh_ports()
-                    else:
-                        self._set_status("Disconnected.", "info")
-                    self.status_window.set_disconnected(payload or None)
-                elif kind == "error":
-                    self._set_connected(False)
-                    self._transport = None
-                    self._update_send_visibility()
-                    self._set_status(f"Connection failed: {payload}", "error")
-                    self._on_refresh_ports()
-                    self.status_window.connect_failed(payload)
-                elif kind == "warning":
-                    self._set_status(payload, "warning")
-                    self.status_window.set_warning(payload)
-                elif kind == "ack":
-                    self._set_status(f"Sent. ESP32: {payload}" if payload else "Sent (no response).", "info")
-                    self.status_window.record_ack(payload)
-                elif kind == "heartbeat":
-                    self.status_window.record_heartbeat(payload)
-        except queue.Empty:
-            pass
-        self.root.after(EVENT_POLL_MS, self._drain_events)
+                try:
+                    kind, payload = self.evt_q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle_event(kind, payload)
+                except Exception as e:
+                    self._set_status(f"Internal error handling {kind!r} event: {e}", "error")
+        finally:
+            self.root.after(EVENT_POLL_MS, self._drain_events)
+
+    def _handle_event(self, kind: str, payload: str):
+        if kind == "connected":
+            self._set_connected(True, payload)
+            self._set_status(f"Connected. {payload}" if payload else "Connected.", "info")
+            self.status_window.set_connected(self._connect_target, matrix_link.BAUD_RATE, payload)
+            # Only serial exists today (see matrix_link.py) -- once
+            # a WiFi transport is added, whichever "connect" path
+            # created it should set TRANSPORT_WIFI instead so
+            # _update_send_visibility can actually show Send.
+            self._transport = status_window.TRANSPORT_SERIAL
+            self._update_send_visibility()
+            # Push whatever's currently rendered right away, rather
+            # than leaving the panel showing nothing (or a stale
+            # frame from before a reconnect) until the user changes
+            # a setting or hits Send -- independent of "Live update",
+            # which only governs pushes made *while* dragging a
+            # slider, not this one-shot sync-on-connect.
+            self._push_frame()
+        elif kind == "disconnected":
+            self._set_connected(False)
+            self._transport = None
+            self._update_send_visibility()
+            if payload:
+                self._set_status(f"Disconnected: {payload}", "error")
+                self._on_refresh_ports()
+            else:
+                self._set_status("Disconnected.", "info")
+            self.status_window.set_disconnected(payload or None)
+        elif kind == "error":
+            self._set_connected(False)
+            self._transport = None
+            self._update_send_visibility()
+            self._set_status(f"Connection failed: {payload}", "error")
+            self._on_refresh_ports()
+            self.status_window.connect_failed(payload)
+        elif kind == "warning":
+            self._set_status(payload, "warning")
+            self.status_window.set_warning(payload)
+        elif kind == "ack":
+            self._set_status(f"Sent. ESP32: {payload}" if payload else "Sent (no response).", "info")
+            self.status_window.record_ack(payload)
+        elif kind == "heartbeat":
+            self.status_window.record_heartbeat(payload)
 
     def _poll_status_window_health(self):
         # qsize() is inherently racy against the worker thread, but this is
         # a debug display, not a control-flow decision -- an occasional
         # off-by-one is fine, and it still catches the two things that
         # actually matter: the worker thread dying, and a frame sitting
-        # queued longer than expected.
-        self.status_window.set_worker_alive(self._worker_thread.is_alive())
-        self.status_window.set_queue_depth(self.frame_q.qsize())
-        self.root.after(STATUS_POLL_MS, self._poll_status_window_health)
+        # queued longer than expected. Reschedule is in `finally` for the
+        # same reason as _drain_events -- this is the only thing keeping
+        # the debug window's worker/queue fields current.
+        try:
+            self.status_window.set_worker_alive(self._worker_thread.is_alive())
+            self.status_window.set_queue_depth(self.frame_q.qsize())
+        finally:
+            self.root.after(STATUS_POLL_MS, self._poll_status_window_health)
 
     # ------------------------------------------------------------------
     # Misc
@@ -856,8 +969,15 @@ class MatrixApp:
     def _on_close(self):
         if self._send_job is not None:
             self.root.after_cancel(self._send_job)
-        if self.connected:
-            self._push_frame(renderer.blank_payload())
+            self._send_job = None
+        # Queue the blank frame unconditionally rather than gating on
+        # self.connected -- that flag is the GUI thread's mirror of the
+        # worker's real state and can lag up to EVENT_POLL_MS behind a
+        # connect that just succeeded, in which case it would still read
+        # False here and no blank frame would go out. The worker's quit
+        # handler already no-ops on an empty frame_q (nothing connected),
+        # so an extra queued blank is harmless.
+        self._push_frame(renderer.blank_payload())
         self.cmd_q.put(("quit", None))
         self._worker_thread.join(timeout=WORKER_JOIN_TIMEOUT_S)
         self.root.destroy()

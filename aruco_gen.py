@@ -69,6 +69,13 @@ def dictionary_size(name: str) -> int:
     return dictionary.bytesList.shape[0]
 
 
+def max_border_bits(name: str) -> int:
+    """Return the largest border width (in modules) that still lets `name`'s
+    markers fit at the matrix's native resolution -- see generate_marker."""
+    dictionary = cv2.aruco.getPredefinedDictionary(DICTIONARIES[name])
+    return (MATRIX_WIDTH - dictionary.markerSize) // 2
+
+
 def generate_marker(name: str, marker_id: int, border_bits: int = 1) -> np.ndarray:
     """Return a (MATRIX_HEIGHT, MATRIX_WIDTH) uint8 grayscale array (0 or
     255) for the given dictionary/ID, rendered directly at the matrix's
@@ -76,11 +83,24 @@ def generate_marker(name: str, marker_id: int, border_bits: int = 1) -> np.ndarr
     size = dictionary_size(name)  # also validates `name`
     if not (0 <= marker_id < size):
         raise ArucoGenError(f"marker id {marker_id} out of range for {name!r} (valid: 0-{size - 1})")
-    if border_bits < 0:
-        raise ArucoGenError(f"border bits must be >= 0, got {border_bits}")
+    # cv2.aruco.generateImageMarker asserts borderBits > 0 and that the
+    # marker (markerSize + 2*borderBits modules) fits within sidePixels --
+    # both would otherwise surface as a raw cv2.error, defeating the whole
+    # point of ArucoGenError (see class docstring). Check them ourselves so
+    # every failure comes back as one exception type callers already catch.
+    limit = max_border_bits(name)
+    if not (1 <= border_bits <= limit):
+        raise ArucoGenError(
+            f"border bits must be between 1 and {limit} for {name!r} at "
+            f"{MATRIX_WIDTH}px, got {border_bits}")
 
     dictionary = cv2.aruco.getPredefinedDictionary(DICTIONARIES[name])
-    return cv2.aruco.generateImageMarker(dictionary, marker_id, MATRIX_WIDTH, borderBits=border_bits)
+    try:
+        return cv2.aruco.generateImageMarker(dictionary, marker_id, MATRIX_WIDTH, borderBits=border_bits)
+    except cv2.error as e:
+        # Backstop for any constraint not modelled above -- still one
+        # exception type for callers, never a raw cv2.error.
+        raise ArucoGenError(f"could not generate marker: {e}") from e
 
 
 def save_marker_png(gray: np.ndarray, name: str, marker_id: int, directory: str) -> str:

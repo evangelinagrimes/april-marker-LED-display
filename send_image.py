@@ -174,8 +174,9 @@ def main(argv=None) -> int:
             print("No response from ESP32 within a few seconds -- "
                   "check its power/connection if the matrix didn't update.")
     except matrix_link.MatrixLinkError as e:
-        print(f"Warning: failed to send image over serial ({args.port}): {e}")
+        print(f"Error: failed to send image over serial ({args.port}): {e}")
         _print_ports()
+        return 1
 
     return 0
 
