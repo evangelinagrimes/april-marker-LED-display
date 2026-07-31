@@ -193,19 +193,3 @@ lives in firmware (not as a PC-side setting) because it's a property of
 the panel's wiring, not a rendering style choice -- the GUI's preview
 always shows the logical (un-remapped) image, so "preview looks right but
 the panel is scrambled" means this constant, not a bug in the Python side.
-
-## Known issues
-
-- **Brightness shifts color on the panel, not just intensity.** Reported
-  while testing the brightness slider: dragging it visibly changes the hue
-  on the physical LEDs, not only how bright they are. `render_rgb()` scales
-  R/G/B by the same factor (`renderer.py`'s `rgb * (brightness / 100.0)`),
-  which is hue-preserving in exact arithmetic -- so the preview (built from
-  that same array) never shows this. Two candidate causes, neither yet
-  confirmed against hardware: (1) integer rounding of the scaled channels
-  before sending -- at low absolute channel values the `+0.5` rounding
-  error is proportionally larger, which can drift the R:G:B ratio as
-  brightness drops; (2) the WS2812 LEDs' own PWM response may not be
-  linear (or matched across channels) at low duty cycles. Needs
-  reproducing on the actual panel across a few brightness/color
-  combinations before picking a fix.
